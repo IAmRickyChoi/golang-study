@@ -10,13 +10,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-	_ "github.com/lib/pq" // PostgreSQL 드라이버 (인터페이스만 사용하므로 _ 로 임포트)
+	_ "github.com/lib/pq"
 )
 
 var jwtKey = []byte("sudoku_secret_key_123")
 var db *sql.DB
 
-// 클라이언트 요청 구조체 (リクエスト構造体)
 type Credentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -24,16 +23,14 @@ type Credentials struct {
 
 type SaveRequest struct {
 	Username string      `json:"username"`
-	Data     interface{} `json:"data"` // Flutter에서 보낼 JSON 데이터를 그대로 받음
+	Data     interface{} `json:"data"`
 }
 
-// JWT 페이로드 구조체
 type Claims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
 
-// 웹소켓 클라이언트 구조체 (VS 모드용)
 type Client struct {
 	conn    *websocket.Conn
 	matched chan *Client
@@ -42,17 +39,14 @@ type Client struct {
 var waitingClient *Client
 var mu sync.Mutex
 
-// 데이터베이스 초기화 및 테이블 자동 생성 함수 (DB初期化)
 func initDB() {
 	var err error
-	// NAS의 로컬 IP(192.168.1.163)와 방금 띄운 PostgreSQL 포트(5432)를 사용합니다.
 	connStr := "postgres://sudoku:sudoku_secret@192.168.1.163:5433/sudokudb?sslmode=disable"
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
 		panic("DB 연결 실패: " + err.Error())
 	}
 
-	// 1. 유저 테이블 생성 (ユーザーテーブル作成)
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
 			username VARCHAR(50) PRIMARY KEY,
@@ -63,8 +57,6 @@ func initDB() {
 		panic("users 테이블 생성 실패: " + err.Error())
 	}
 
-	// 2. 저장된 게임 테이블 생성 (セーブデータテーブル作成)
-	// JSONB 타입으로 스도쿠 판 데이터를 통째로 저장합니다.
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS saved_games (
 			username VARCHAR(50) PRIMARY KEY REFERENCES users(username),
@@ -76,7 +68,6 @@ func initDB() {
 		panic("saved_games 테이블 생성 실패: " + err.Error())
 	}
 
-	// [테스트용] 프론트엔드 테스트를 위해 기본 계정들을 DB에 미리 넣어둡니다.
 	db.Exec(`INSERT INTO users (username, password) VALUES ('whatyousaid', 'password123') ON CONFLICT DO NOTHING;`)
 	db.Exec(`INSERT INTO users (username, password) VALUES ('ricky', 'password123') ON CONFLICT DO NOTHING;`)
 
@@ -90,12 +81,20 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
-	// 서버 시작 전 DB 연결
 	initDB()
-
 	r := gin.Default()
 
-	// [API 1] 로그인 (ログイン) - 하드코딩 맵 대신 실제 DB를 조회합니다.
+	r.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
+
 	r.POST("/api/login", func(c *gin.Context) {
 		var creds Credentials
 		if err := c.BindJSON(&creds); err != nil {
@@ -103,7 +102,6 @@ func main() {
 			return
 		}
 
-		// DB에서 비밀번호 조회 (DBからパスワードを検索)
 		var dbPassword string
 		err := db.QueryRow("SELECT password FROM users WHERE username = $1", creds.Username).Scan(&dbPassword)
 		if err != nil {
@@ -139,7 +137,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"token": tokenString, "username": creds.Username})
 	})
 
-	// [API 2] 게임 저장 (ゲームの保存, セーブ)
 	r.POST("/api/save", func(c *gin.Context) {
 		var req SaveRequest
 		if err := c.BindJSON(&req); err != nil {
@@ -147,7 +144,6 @@ func main() {
 			return
 		}
 
-		// UPSERT 쿼리: 데이터가 없으면 INSERT, 이미 있으면 UPDATE 처리 (UPSERT処理)
 		query := `
 			INSERT INTO saved_games (username, game_data, updated_at) 
 			VALUES ($1, $2, CURRENT_TIMESTAMP)
@@ -164,7 +160,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"message": "성공적으로 저장되었습니다."})
 	})
 
-	// [API 3] 저장된 게임 불러오기 (ゲームの読み込み, ロード)
 	r.GET("/api/load", func(c *gin.Context) {
 		username := c.Query("username")
 		if username == "" {
@@ -183,11 +178,9 @@ func main() {
 			return
 		}
 
-		// JSON 문자열을 그대로 반환
 		c.Data(http.StatusOK, "application/json", []byte(gameData))
 	})
 
-	// [API 4] 기존 실시간 대전 웹소켓 (オンライン対戦ソケット)
 	r.GET("/ws/match", func(c *gin.Context) {
 		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -228,7 +221,8 @@ func main() {
 			waitingClient = nil
 			mu.Unlock()
 
-			seed := time.Now().UnixNano()
+			// 👇 [핵심 수정] UnixNano()를 자바스크립트가 버틸 수 있는 UnixMilli()로 변경! (桁数削減)
+			seed := time.Now().UnixMilli()
 			matchData := gin.H{"type": "matched", "seed": seed, "difficulty": "medium"}
 
 			p1.conn.WriteJSON(matchData)
