@@ -26,18 +26,23 @@ type SaveRequest struct {
 	Data     interface{} `json:"data"`
 }
 
+type RecordRequest struct {
+	Username string `json:"username"`
+	Result   string `json:"result"` // "win" or "loss"
+}
+
 type Claims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
 
-type Client struct {
-	conn    *websocket.Conn
-	matched chan *Client
+type MatchClient struct {
+	conn     *websocket.Conn
+	opponent *MatchClient
 }
 
-var waitingClient *Client
-var mu sync.Mutex
+var waitingMatchClient *MatchClient
+var matchMu sync.Mutex
 
 func initDB() {
 	var err error
@@ -50,12 +55,18 @@ func initDB() {
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
 			username VARCHAR(50) PRIMARY KEY,
-			password VARCHAR(255) NOT NULL
+			password VARCHAR(255) NOT NULL,
+			wins INT DEFAULT 0,
+			losses INT DEFAULT 0
 		);
 	`)
 	if err != nil {
 		panic("users 테이블 생성 실패: " + err.Error())
 	}
+
+	// 기존 테이블이 있을 경우를 대비해 승패 컬럼을 안전하게 추가합니다 (マイグレーション)
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INT DEFAULT 0;`)
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS losses INT DEFAULT 0;`)
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS saved_games (
@@ -67,9 +78,6 @@ func initDB() {
 	if err != nil {
 		panic("saved_games 테이블 생성 실패: " + err.Error())
 	}
-
-	db.Exec(`INSERT INTO users (username, password) VALUES ('whatyousaid', 'password123') ON CONFLICT DO NOTHING;`)
-	db.Exec(`INSERT INTO users (username, password) VALUES ('ricky', 'password123') ON CONFLICT DO NOTHING;`)
 
 	fmt.Println("PostgreSQL 데이터베이스 세팅 완료!")
 }
@@ -93,6 +101,41 @@ func main() {
 			return
 		}
 		c.Next()
+	})
+
+	// [신규] 회원가입 API
+	r.POST("/api/register", func(c *gin.Context) {
+		var creds Credentials
+		if err := c.BindJSON(&creds); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+			return
+		}
+
+		var exists bool
+		db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)", creds.Username).Scan(&exists)
+		if exists {
+			c.JSON(http.StatusConflict, gin.H{"error": "이미 사용 중인 아이디입니다."})
+			return
+		}
+
+		_, err := db.Exec("INSERT INTO users (username, password, wins, losses) VALUES ($1, $2, 0, 0)", creds.Username, creds.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "가입 실패"})
+			return
+		}
+
+		expirationTime := time.Now().Add(24 * time.Hour)
+		claims := &Claims{
+			Username: creds.Username,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(expirationTime),
+			},
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, _ := token.SignedString(jwtKey)
+
+		c.JSON(http.StatusOK, gin.H{"token": tokenString, "username": creds.Username})
 	})
 
 	r.POST("/api/login", func(c *gin.Context) {
@@ -127,14 +170,38 @@ func main() {
 		}
 
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-		tokenString, err := token.SignedString(jwtKey)
+		tokenString, _ := token.SignedString(jwtKey)
 
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "토큰 생성 실패"})
+		c.JSON(http.StatusOK, gin.H{"token": tokenString, "username": creds.Username})
+	})
+
+	// [신규] 승패 기록 API
+	r.POST("/api/record", func(c *gin.Context) {
+		var req RecordRequest
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "잘못된 데이터 형식입니다."})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"token": tokenString, "username": creds.Username})
+		if req.Result == "win" {
+			db.Exec("UPDATE users SET wins = wins + 1 WHERE username = $1", req.Username)
+		} else if req.Result == "loss" {
+			db.Exec("UPDATE users SET losses = losses + 1 WHERE username = $1", req.Username)
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "전적 기록 완료"})
+	})
+
+	// [신규] 전적 조회 API
+	r.GET("/api/stats", func(c *gin.Context) {
+		username := c.Query("username")
+		var wins, losses int
+		err := db.QueryRow("SELECT wins, losses FROM users WHERE username = $1", username).Scan(&wins, &losses)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"wins": 0, "losses": 0})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"wins": wins, "losses": losses})
 	})
 
 	r.POST("/api/save", func(c *gin.Context) {
@@ -150,34 +217,18 @@ func main() {
 			ON CONFLICT (username) 
 			DO UPDATE SET game_data = EXCLUDED.game_data, updated_at = CURRENT_TIMESTAMP;
 		`
-		_, err := db.Exec(query, req.Username, req.Data)
-		if err != nil {
-			fmt.Println("저장 실패:", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "DB 저장 실패"})
-			return
-		}
-
+		db.Exec(query, req.Username, req.Data)
 		c.JSON(http.StatusOK, gin.H{"message": "성공적으로 저장되었습니다."})
 	})
 
 	r.GET("/api/load", func(c *gin.Context) {
 		username := c.Query("username")
-		if username == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "유저 이름이 필요합니다."})
-			return
-		}
-
 		var gameData string
 		err := db.QueryRow("SELECT game_data FROM saved_games WHERE username = $1", username).Scan(&gameData)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				c.JSON(http.StatusNotFound, gin.H{"error": "저장된 게임이 없습니다."})
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "DB 조회 실패"})
-			}
+			c.JSON(http.StatusNotFound, gin.H{"error": "저장된 게임이 없습니다."})
 			return
 		}
-
 		c.Data(http.StatusOK, "application/json", []byte(gameData))
 	})
 
@@ -187,64 +238,66 @@ func main() {
 			return
 		}
 
-		client := &Client{
-			conn:    ws,
-			matched: make(chan *Client),
-		}
+		client := &MatchClient{conn: ws}
 
-		mu.Lock()
-		if waitingClient == nil {
-			waitingClient = client
-			mu.Unlock()
+		matchMu.Lock()
+		if waitingMatchClient == nil {
+			waitingMatchClient = client
+			matchMu.Unlock()
 
 			ws.WriteJSON(gin.H{"type": "waiting", "message": "상대방을 기다리는 중..."})
 
-			disconnect := make(chan struct{})
-			go func() {
-				_, _, _ = ws.ReadMessage()
-				close(disconnect)
-			}()
+			for {
+				msgType, msg, err := ws.ReadMessage()
+				if err != nil {
+					matchMu.Lock()
+					if waitingMatchClient == client {
+						waitingMatchClient = nil
+					}
+					matchMu.Unlock()
 
-			select {
-			case opponent := <-client.matched:
-				relayMessages(client.conn, opponent.conn)
-			case <-disconnect:
-				mu.Lock()
-				if waitingClient == client {
-					waitingClient = nil
+					if client.opponent != nil {
+						client.opponent.conn.WriteJSON(gin.H{"type": "opponent_left"})
+						time.Sleep(100 * time.Millisecond)
+						client.opponent.conn.Close()
+					}
+					break
 				}
-				mu.Unlock()
-				ws.Close()
+				if client.opponent != nil {
+					client.opponent.conn.WriteMessage(msgType, msg)
+				}
 			}
 		} else {
-			p1 := waitingClient
-			waitingClient = nil
-			mu.Unlock()
+			opponent := waitingMatchClient
+			waitingMatchClient = nil
+			matchMu.Unlock()
 
-			// 👇 [핵심 수정] UnixNano()를 자바스크립트가 버틸 수 있는 UnixMilli()로 변경! (桁数削減)
+			client.opponent = opponent
+			opponent.opponent = client
+
 			seed := time.Now().UnixMilli()
 			matchData := gin.H{"type": "matched", "seed": seed, "difficulty": "medium"}
 
-			p1.conn.WriteJSON(matchData)
+			opponent.conn.WriteJSON(matchData)
 			ws.WriteJSON(matchData)
 
-			p1.matched <- client
-			relayMessages(ws, p1.conn)
+			for {
+				msgType, msg, err := ws.ReadMessage()
+				if err != nil {
+					if client.opponent != nil {
+						client.opponent.conn.WriteJSON(gin.H{"type": "opponent_left"})
+						time.Sleep(100 * time.Millisecond)
+						client.opponent.conn.Close()
+					}
+					break
+				}
+				if client.opponent != nil {
+					client.opponent.conn.WriteMessage(msgType, msg)
+				}
+			}
 		}
 	})
 
 	fmt.Println("서버가 8080 포트에서 실행 중입니다...")
 	r.Run(":8080")
-}
-
-func relayMessages(src, dst *websocket.Conn) {
-	for {
-		_, msg, err := src.ReadMessage()
-		if err != nil {
-			dst.Close()
-			src.Close()
-			break
-		}
-		dst.WriteMessage(websocket.TextMessage, msg)
-	}
 }
