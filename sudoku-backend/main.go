@@ -28,7 +28,7 @@ type SaveRequest struct {
 
 type RecordRequest struct {
 	Username string `json:"username"`
-	Result   string `json:"result"` // "win" or "loss"
+	Result   string `json:"result"`
 }
 
 type Claims struct {
@@ -64,7 +64,6 @@ func initDB() {
 		panic("users 테이블 생성 실패: " + err.Error())
 	}
 
-	// 기존 테이블이 있을 경우를 대비해 승패 컬럼을 안전하게 추가합니다 (マイグレーション)
 	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INT DEFAULT 0;`)
 	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS losses INT DEFAULT 0;`)
 
@@ -103,7 +102,6 @@ func main() {
 		c.Next()
 	})
 
-	// [신규] 회원가입 API
 	r.POST("/api/register", func(c *gin.Context) {
 		var creds Credentials
 		if err := c.BindJSON(&creds); err != nil {
@@ -175,7 +173,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"token": tokenString, "username": creds.Username})
 	})
 
-	// [신규] 승패 기록 API
 	r.POST("/api/record", func(c *gin.Context) {
 		var req RecordRequest
 		if err := c.BindJSON(&req); err != nil {
@@ -188,11 +185,9 @@ func main() {
 		} else if req.Result == "loss" {
 			db.Exec("UPDATE users SET losses = losses + 1 WHERE username = $1", req.Username)
 		}
-
 		c.JSON(http.StatusOK, gin.H{"message": "전적 기록 완료"})
 	})
 
-	// [신규] 전적 조회 API
 	r.GET("/api/stats", func(c *gin.Context) {
 		username := c.Query("username")
 		var wins, losses int
@@ -233,6 +228,12 @@ func main() {
 	})
 
 	r.GET("/ws/match", func(c *gin.Context) {
+		username := c.Query("username")
+		if username == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "username is required"})
+			return
+		}
+
 		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			return
@@ -256,6 +257,7 @@ func main() {
 					}
 					matchMu.Unlock()
 
+					// 👇 [수정] 무단으로 패배를 추가하던 코드를 지웠습니다!
 					if client.opponent != nil {
 						client.opponent.conn.WriteJSON(gin.H{"type": "opponent_left"})
 						time.Sleep(100 * time.Millisecond)
@@ -284,6 +286,7 @@ func main() {
 			for {
 				msgType, msg, err := ws.ReadMessage()
 				if err != nil {
+					// 👇 [수정] 여기서도 패배 강제 추가 로직을 지웠습니다!
 					if client.opponent != nil {
 						client.opponent.conn.WriteJSON(gin.H{"type": "opponent_left"})
 						time.Sleep(100 * time.Millisecond)
