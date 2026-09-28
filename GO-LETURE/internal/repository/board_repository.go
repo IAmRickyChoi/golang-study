@@ -23,3 +23,11 @@ func (r *BoardRepository) FindById(id int) (*model.Board, error) {
 	err := r.db.First(&board, id).Error
 	return &board, err
 }
+
+func (r *BoardRepository) Update(board *model.Board) error {
+	return r.db.Save(board).Error
+}
+
+func (r *BoardRepository) Delete(id int) error {
+	return r.db.Delete(&model.Board{}, id).Error
+}

@@ -19,6 +19,8 @@ func main() {
 
 	r.POST("/board/add", boardService.RegisterBoard)
 	r.GET("/board/get/:id", boardService.GetBoardById)
+	r.PUT("/board/update", boardService.UpdateBoard)
+	r.DELETE("/board/delete/:id", boardService.DeleteBoard)
 
 	r.Run(":9900")
 }
