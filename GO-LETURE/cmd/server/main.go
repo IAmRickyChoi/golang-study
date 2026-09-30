@@ -15,12 +15,18 @@ func main() {
 	boardRepo := repository.NewBoardRepository(repository.DB)
 	boardService := service.NewBoardService(boardRepo)
 
-	r := gin.Default()
+	compRepo := repository.NewCompRepository(repository.DB)
+	authService := service.NewAuthService(compRepo)
 
-	r.POST("/board/add", boardService.RegisterBoard)
-	r.GET("/board/get/:id", boardService.GetBoardById)
-	r.PUT("/board/update", boardService.UpdateBoard)
-	r.DELETE("/board/delete/:id", boardService.DeleteBoard)
+	r := gin.Default()
+	authMiddleware := authService.AuthMiddleware()
+	authorized := r.Group("/", authMiddleware)
+
+	authorized.POST("/board/add", boardService.RegisterBoard)
+	authorized.GET("/board/get/:id", boardService.GetBoardById)
+	authorized.PUT("/board/update", boardService.UpdateBoard)
+	authorized.DELETE("/board/delete/:id", boardService.DeleteBoard)
+	r.POST("/auth/token", authService.MakeToken)
 
 	r.Run(":9900")
 }
