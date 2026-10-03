@@ -4,11 +4,19 @@ import (
 	"go-api/internal/config"
 	"go-api/internal/repository"
 	"go-api/internal/service"
+	"go-api/pkg/util"
 
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
+	cfg2, err := util.LoadConfic("internal/config/config.yaml")
+	if err != nil {
+		panic(err)
+	}
+
+	util.InitZapLogger(cfg2)
+
 	cfg := config.Load()
 	repository.InitDB(cfg.DSN())
 

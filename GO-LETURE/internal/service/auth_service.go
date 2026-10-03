@@ -3,6 +3,7 @@ package service
 import (
 	"go-api/internal/model"
 	"go-api/internal/repository"
+	logging "go-api/pkg/util"
 	"strings"
 	"time"
 
@@ -84,6 +85,10 @@ func (s *AuthService) AuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+
+		logging.Info("Req id: " + companyId)
+		logging.Debug("Header: " + authHeader)
+		logging.Error("This is a test error log")
 
 		c.Set("company", comp)
 		c.Next()
